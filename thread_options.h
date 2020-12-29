@@ -36,6 +36,8 @@ enum fio_memtype {
 #define BSSPLIT_MAX	64
 #define ZONESPLIT_MAX	256
 
+#define ZBD_MAX_OPEN_ZONES	4096
+
 struct bssplit {
 	uint64_t bs;
 	uint32_t perc;
@@ -117,6 +119,7 @@ struct thread_options {
 	unsigned int pre_read;
 	unsigned int sync_io;
 	unsigned int write_hint;
+	unsigned int stream_id;
 	unsigned int verify;
 	unsigned int do_verify;
 	unsigned int verify_interval;
@@ -197,6 +200,7 @@ struct thread_options {
 	unsigned long long zone_capacity;
 	unsigned long long zone_skip;
 	enum fio_zone_mode zone_mode;
+	unsigned int zone_append;
 	unsigned long long lockmem;
 	enum fio_memtype mem_type;
 	unsigned int mem_align;
@@ -348,9 +352,28 @@ struct thread_options {
 	unsigned int read_beyond_wp;
 	int max_open_zones;
 	unsigned int job_max_open_zones;
+	int num_open_zones;
+	int num_filled_zones;
+	int num_zones;
+	uint32_t open_zones[ZBD_MAX_OPEN_ZONES];
+	bool fill_empty_zones_first;
+	uint32_t ns_id;
+	bool issue_zone_finish;
+	uint32_t commit_gran;
+	uint32_t exp_commit;
+	uint32_t zrwa_alloc;
+	uint32_t zrwa_overwrite_percent;
+	uint32_t zrwa_divisor;
+	uint32_t zrwa_rand_ow;
+	uint32_t finish_zone_pct;
+	uint32_t dynamic_qd;
 	fio_fp64_t zrt;
 	fio_fp64_t zrf;
+	bool reset_all_zones_first;
+	bool reset_active_zones_first;
 };
+
+
 
 #define FIO_TOP_STR_MAX		256
 
@@ -640,6 +663,8 @@ struct thread_options_pack {
 	uint32_t allow_mounted_write;
 
 	uint32_t zone_mode;
+	uint32_t stream_id;
+	uint32_t zone_append;
 } __attribute__((packed));
 
 extern void convert_thread_options_to_cpu(struct thread_options *o, struct thread_options_pack *top);

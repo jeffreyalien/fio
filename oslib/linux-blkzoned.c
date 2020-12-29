@@ -22,12 +22,18 @@
 #include "zbd_types.h"
 
 #include <linux/blkzoned.h>
+#include <linux/nvme_ioctl.h>
+
+#define	NVME_ZONE_MGMT_SEND_ZRWAA	9
+#define NVME_ZONE_ACTION_OPEN       	0x3
+#define NVME_ZONE_ACTION_COMMIT		0x11
+
 
 /*
  * Read up to 255 characters from the first line of a file. Strip the trailing
  * newline.
  */
-static char *read_file(const char *path)
+char *read_file(const char *path)
 {
 	char line[256], *p = line;
 	FILE *f;
@@ -215,6 +221,116 @@ out:
 	return ret;
 }
 
+int zbd_zone_mgmt_report(struct thread_data *td, struct fio_file *f,
+			  uint64_t offset, struct zbd_zone *zones,
+			  unsigned int nr_zones, uint16_t block_size)
+{
+	struct nvme_zone_report_header	*hdr = NULL;
+	struct nvme_zone_log *zone_log;
+	struct zbd_zone *z;
+	unsigned int i;
+	int fd = -1, ret;
+	int log_len;
+	void * buff;
+	uint16_t zone_info_sz;
+	struct nvme_passthru_cmd cmd;
+	memset(&cmd, 0, sizeof(cmd));
+
+	zone_info_sz = sizeof(struct nvme_zone_log);
+	log_len = sizeof(struct nvme_zone_report_header) + (sizeof(struct nvme_zone_log) * nr_zones);
+	buff = calloc(1, log_len);
+	if (!buff) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	fd = f->fd;
+	if (fd < 0) {
+		fd = open(f->file_name, O_RDWR | O_LARGEFILE);
+		if (fd < 0)
+			return -errno;
+	}
+
+	cmd.opcode		=  nvme_cmd_zone_mgmt_recv;
+	cmd.nsid		= td->o.ns_id;
+	cmd.cdw10		= offset & 0xffffffff;
+	cmd.cdw11		= offset >> 32;
+	cmd.cdw13		= 0;
+	cmd.cdw12		= (log_len / 4) - 1,
+	cmd.addr		= (__u64)(uintptr_t)buff;
+	cmd.data_len	= log_len;
+
+	ret = ioctl(fd, NVME_IOCTL_IO_CMD, &cmd);
+	if (ret) {
+		ret = -errno;
+		dprint(FD_ZBD, "zbd_zone_mgmt_report: Failed, ret = %d\n", ret);
+		goto out;
+	}
+
+	hdr = (struct nvme_zone_report_header *)buff;
+	buff += sizeof(*hdr);
+	nr_zones = hdr->nr_zones;
+	z = &zones[0];
+	dprint(FD_ZBD, "zbd_zone_mgmt_report: num zones = %d, id = %d\n", nr_zones, td->thread_number);
+	for (i = 0; i < nr_zones; i++, z++) {
+		zone_log = (struct nvme_zone_log *)buff;
+
+		z->start = zone_log->slba * block_size;
+		z->wp = zone_log->wp * block_size;
+		z->capacity = zone_log->capacity * block_size;
+		z->attr = zone_log->zone_attrs;
+
+		switch (zone_log->zone_type) {
+		case BLK_ZONE_TYPE_CONVENTIONAL:
+			z->type = ZBD_ZONE_TYPE_CNV;
+			break;
+		case BLK_ZONE_TYPE_SEQWRITE_REQ:
+			z->type = ZBD_ZONE_TYPE_SWR;
+			break;
+		case BLK_ZONE_TYPE_SEQWRITE_PREF:
+			z->type = ZBD_ZONE_TYPE_SWP;
+			break;
+		default:
+			td_verror(td, errno, "invalid zone type");
+			log_err("zbd_zone_mgmt_report %s: invalid type %d for zone at sector %llu.\n",
+				f->file_name, zone_log->zone_type, (unsigned long long)(offset >> 9));
+			ret = -EIO;
+			goto out;
+		}
+
+		switch (zone_log->zone_state) {
+		case NVME_ZONE_EMPTY:
+			z->cond = ZBD_ZONE_COND_EMPTY;
+			break;
+		case NVME_ZONE_IMPLICITLY_OPENED:
+			z->cond = ZBD_ZONE_COND_IMP_OPEN;
+			break;
+		case NVME_ZONE_EXPLICITLY_OPENED:
+			z->cond = ZBD_ZONE_COND_EXP_OPEN;
+			break;
+		case NVME_ZONE_CLOSED:
+			z->cond = ZBD_ZONE_COND_CLOSED;
+			break;
+		case NVME_ZONE_FULL:
+			z->cond = ZBD_ZONE_COND_FULL;
+			break;
+		case NVME_ZONE_READONLY:
+		case NVME_ZONE_OFFLINE:
+		default:
+			/* Treat all these conditions as offline (don't use!) */
+			z->cond = ZBD_ZONE_COND_OFFLINE;
+			break;
+		}
+		buff += zone_info_sz;
+	}
+
+	ret = nr_zones;
+out:
+	free((void*)hdr);
+	close(fd);
+	return ret;
+}
+
 int blkzoned_reset_wp(struct thread_data *td, struct fio_file *f,
 		      uint64_t offset, uint64_t length)
 {
@@ -240,3 +356,239 @@ int blkzoned_reset_wp(struct thread_data *td, struct fio_file *f,
 
 	return ret;
 }
+
+
+int zbd_get_open_count(int fd, int nsid, int implicit)
+{
+	int ret;
+	int log_len;
+	struct nvme_zone_report_header * report_header;
+	void * buff;
+	struct nvme_passthru_cmd cmd;
+	memset(&cmd, 0, sizeof(cmd));
+
+	log_len = sizeof(struct nvme_zone_log) +
+		sizeof(struct nvme_zone_report_header);
+
+	buff = malloc(log_len);
+	if (!buff) {
+		return -1;
+	}
+
+	cmd.opcode     = nvme_cmd_zone_mgmt_recv;
+	cmd.nsid       = nsid;
+	cmd.cdw10      = 0;
+	cmd.cdw11      = 0;
+	cmd.cdw13      = (2 + implicit) << 8;
+	cmd.addr       = (__u64)(uintptr_t)buff;
+	cmd.data_len   = log_len;
+
+	ret = ioctl(fd, NVME_IOCTL_IO_CMD, &cmd);
+	if (ret > 0) {
+		perror("zbd_get_open_count failed ioctl returned:");
+		dprint(FD_ZBD, "zbd_get_open_count failed nsid = %d\n", nsid);
+		return -1;
+	}
+
+	report_header = (struct nvme_zone_report_header *)buff;
+	return report_header->nr_zones;
+
+}
+
+bool zbd_identify_ns(struct thread_data *td, struct fio_file *f, void *ns, void *ns_zns, int nsid)
+{
+	int fd, ret = 0;
+	struct nvme_passthru_cmd cmd;
+	memset(&cmd, 0, sizeof(cmd));
+
+	fd = open(f->file_name, O_RDONLY | O_LARGEFILE);
+	if (fd < 0) {
+		ret = -errno;
+		goto close;
+	}
+
+	cmd.opcode     = 6;				//nvme_admin_identify
+	cmd.nsid       = nsid;
+	cmd.cdw10      = 0; // NVME_ID_CNS_NS = 0x00,  Identify Namespace data structure
+						// for the specified NSID or the common namespace capabilities for the NVM
+	cmd.cdw11      = 0; // csi = 0 for cns
+	cmd.addr       = (__u64)(uintptr_t)ns;
+	cmd.data_len   = sizeof (struct nvme_id_ns); //4096;
+
+	ret = ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd);
+	if (ret > 0) {
+		perror("ioctl returned:");
+	}
+	cmd.cdw10      = 5;	// 	NVME_ID_CNS_CSI_ID_NS = 0x05, Identify I/O Command Set specific Namespace data structure
+						// for the specified NSID for the I/O Command Set
+	cmd.cdw11      = 2 << 24; // csi = 2 for zns
+	cmd.addr       = (__u64)(uintptr_t)ns_zns;
+	cmd.data_len   = sizeof (struct nvme_id_ns_zns); //4096;
+	ret = ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd);
+	if (ret > 0) {
+		perror("zbd_identify_ns: ioctl returned:");
+
+	}
+
+close:
+	close(fd);
+	if (ret != 0)
+		return false;
+
+	return true;
+}
+
+int zbd_get_nsid(struct fio_file *f)
+{
+	static struct stat nvme_stat;
+	int fd, err = 0;
+
+	fd = open(f->file_name, O_RDONLY | O_LARGEFILE);
+	if (fd < 0) {
+		err = -errno;
+		goto close;
+	}
+
+	err = fstat(fd, &nvme_stat);
+
+	if (err < 0)
+		goto close;
+
+	if (!S_ISBLK(nvme_stat.st_mode)) {
+		log_err("Error: requesting namespace-id from non-block device\n");
+		err = ENOTBLK;
+		goto close;
+	}
+
+	err = ioctl(fd, NVME_IOCTL_ID);
+
+close:
+	close(fd);
+
+	return err;
+
+}
+
+bool zbd_zone_reset(struct thread_data *td, struct fio_file *f, uint64_t slba, bool all_zones, int nsid)
+{
+	int fd, ret;
+	bool reply = true;
+	struct buf_output out;
+	struct nvme_passthru_cmd cmd;
+	memset(&cmd, 0, sizeof(cmd));
+
+	fd = f->fd;
+	if (fd < 0) {
+		fd = open(f->file_name, O_RDWR | O_LARGEFILE);
+		if (fd < 0)
+			return false;
+	}
+
+	dprint(FD_ZBD, "zbd_zone_reset: filename = %s slba = 0x%lX, nsid = %d \n", f->file_name, slba, nsid);
+
+	cmd.opcode     = nvme_cmd_zone_mgmt_send;
+	cmd.nsid       = nsid;
+	cmd.cdw10      = slba & 0xffffffff;
+	cmd.cdw11      = slba >> 32;
+	if (all_zones)
+		cmd.cdw13      = (1 << NVME_ZONE_MGMT_SEND_SELECT_ALL) | NVME_ZONE_ACTION_RESET;
+	else
+		cmd.cdw13      = NVME_ZONE_ACTION_RESET;
+	cmd.addr       = (__u64)(uintptr_t)NULL;
+	cmd.data_len   = 0;
+
+	if (all_zones) {
+		buf_output_init(&out);
+		__log_buf(&out, "Resetting all zones\n");
+		log_info_buf(out.buf, out.buflen);
+	}
+	ret = ioctl(fd, NVME_IOCTL_IO_CMD, &cmd);
+
+	if (ret > 0) {
+		perror("zbd_zone_reset failed- ioctl returned: ");
+		dprint(FD_ZBD, "zbd_zone_reset: ret = %d \n", ret);
+		reply =  false;
+	}
+
+	if (all_zones)
+		buf_output_free(&out);
+
+	close(fd);
+
+	return reply;
+}
+
+int zbd_issue_finish(struct thread_data *td, struct fio_file *f,
+		      uint64_t offset, uint64_t length)
+{
+
+	struct blk_zone_range zr = {
+		.sector         = offset >> 9,
+		.nr_sectors     = length >> 9,
+	};
+
+	if (ioctl(f->fd, BLKFINISHZONE, &zr) < 0)
+		return -errno;
+
+	return 0;
+}
+
+bool zbd_issue_commit_zone(const struct fio_file *f, uint32_t zone_idx, uint64_t lba, uint64_t slba, int nsid)
+{
+	int ret;
+	uint32_t cdw13 = 0;
+	struct nvme_passthru_cmd cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cdw13 = NVME_ZONE_ACTION_COMMIT;
+
+	cmd.opcode     = 0x79;				//nvme_cmd_zone_mgmt_send
+	cmd.nsid       = nsid;
+	cmd.cdw10      = lba & 0xffffffff;
+	cmd.cdw11      = lba >> 32;
+	cmd.cdw13      = cdw13;
+	cmd.addr       = (__u64)(uintptr_t)NULL;
+	cmd.data_len   = 0;
+
+	dprint(FD_ZBD, "Issuing commit_zone to zone %d, slba 0x%lX, nsid %d, lba = 0x%lX\n", zone_idx,
+						slba, nsid, lba);
+	ret = ioctl(f->fd, NVME_IOCTL_IO_CMD, &cmd);
+	if (ret > 0) {
+		perror("zbd_issue_commit_zone failed - ioctl returned:");
+		log_err("zbd_issue_commit_zone failed: slba = 0x%lX, ret = %X \n", slba, ret);
+		return false;
+	}
+	return true;
+}
+
+bool zbd_issue_exp_open_zrwa(const struct fio_file *f, uint32_t zone_idx,
+		uint64_t slba , uint32_t nsid)
+{
+	int ret;
+	uint32_t cdw13 = 0;
+	uint32_t zrwaa = 1;
+	struct nvme_passthru_cmd cmd;
+	memset(&cmd, 0, sizeof(cmd));
+
+	cdw13 = NVME_ZONE_ACTION_OPEN; //Open zone explicitly
+	cdw13 |= zrwaa << NVME_ZONE_MGMT_SEND_ZRWAA; //Set this bit to indicate alloc zrwa
+
+	cmd.opcode     = 0x79;				//nvme_cmd_zone_mgmt_send
+	cmd.nsid       = nsid;
+	cmd.cdw10      = slba & 0xffffffff;
+	cmd.cdw11      = slba >> 32;
+	cmd.cdw13      = cdw13;
+	cmd.addr       = (__u64)(uintptr_t)NULL;
+	cmd.data_len   = 0;
+
+	dprint(FD_ZBD, "Issuing Exp-Open to zone %d, slba 0x%lX, nsid %d\n", zone_idx,
+						slba, nsid);
+	ret = ioctl(f->fd, NVME_IOCTL_IO_CMD, &cmd);
+	if (ret > 0) {
+		perror("zbd_issue_exp_open_zrwa failed - ioctl returned:");
+		dprint(FD_ZBD, "zbd_issue_exp_open_zrwa failed: slba = 0x%lX \n", slba);
+		return false;
+	}
+	return true;
+}
+

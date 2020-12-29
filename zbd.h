@@ -12,20 +12,31 @@
 #include "oslib/blkzoned.h"
 #include "zbd_types.h"
 
+#ifndef RWF_ZONE_APPEND
+#define RWF_ZONE_APPEND        0x00000020
+#endif
+
 struct fio_file;
 
 enum io_u_action {
 	io_u_accept	= 0,
 	io_u_eof	= 1,
 };
+enum zone_last_io_status {
+	ZONE_LAST_IO_NOT_SUBMITTED	= 0,
+	ZONE_LAST_IO_QUEUED		= 1,
+	ZONE_LAST_IO_COMPLETED		= 2,
+};
 
 /**
  * struct fio_zone_info - information about a single ZBD zone
  * @start: zone start location (bytes)
  * @wp: zone write pointer location (bytes)
- * @capacity: maximum size usable from the start of a zone (bytes)
+ * @pending_ios: Number of IO's pending in this zone
+ * @capacity: maximum writable location within a zone (bytes)
  * @verify_block: number of blocks that have been verified for this zone
  * @mutex: protects the modifiable members in this structure
+ * @reset_cond: zone reset check condition. only relevant for zone_append.
  * @type: zone type (BLK_ZONE_TYPE_*)
  * @cond: zone state (BLK_ZONE_COND_*)
  * @open: whether or not this zone is currently open. Only relevant if
@@ -34,14 +45,25 @@ enum io_u_action {
  */
 struct fio_zone_info {
 	pthread_mutex_t		mutex;
+	pthread_cond_t		reset_cond;
 	uint64_t		start;
 	uint64_t		wp;
+	uint64_t		dev_wp;
 	uint64_t		capacity;
 	uint32_t		verify_block;
+	uint32_t		ow_count;
+	uint32_t		pending_ios;
+	uint64_t		prev_ow_lba;
+	uint64_t		prev_commit_lba;
+	uint8_t			finish_pct;
 	enum zbd_zone_type	type:2;
 	enum zbd_zone_cond	cond:4;
 	unsigned int		open:1;
 	unsigned int		reset_zone:1;
+	unsigned int		finish_zone:1;
+	unsigned int		io_q_count;
+	uint8_t			last_io;
+	uint64_t		*zone_io_q;
 };
 
 /**
@@ -72,13 +94,13 @@ struct zoned_block_device_info {
 	uint32_t		max_open_zones;
 	pthread_mutex_t		mutex;
 	uint64_t		zone_size;
+	uint16_t                block_size;
 	uint64_t		sectors_with_data;
 	uint32_t		zone_size_log2;
 	uint32_t		nr_zones;
 	uint32_t		refcount;
-	uint32_t		num_open_zones;
 	uint32_t		write_cnt;
-	uint32_t		open_zones[ZBD_MAX_OPEN_ZONES];
+	uint64_t		*zones_io_q_buf;
 	struct fio_zone_info	zone_info[0];
 };
 
@@ -91,6 +113,8 @@ enum fio_ddir zbd_adjust_ddir(struct thread_data *td, struct io_u *io_u,
 			      enum fio_ddir ddir);
 enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u);
 char *zbd_write_status(const struct thread_stat *ts);
+unsigned int zbd_can_zrwa_queue_more(struct thread_data *td,
+				const struct io_u *io_u);
 
 static inline void zbd_close_file(struct fio_file *f)
 {

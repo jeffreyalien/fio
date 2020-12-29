@@ -11,6 +11,9 @@
 #ifdef CONFIG_LIBAIO
 #include <libaio.h>
 #endif
+#ifdef CONFIG_GUASI
+#include <guasi.h>
+#endif
 
 enum {
 	IO_U_F_FREE		= 1 << 0,
@@ -92,6 +95,11 @@ struct io_u {
 	};
 
 	/*
+	 * for zone append this is the start offset of the zone.
+	 */
+	unsigned long long zone_start_offset;
+
+	/*
 	 * ZBD mode zbd_queue_io callback: called after engine->queue operation
 	 * to advance a zone write pointer and eventually unlock the I/O zone.
 	 * @q indicates the I/O queue status (busy, queued or completed).
@@ -121,6 +129,9 @@ struct io_u {
 #endif
 #ifdef FIO_HAVE_SGIO
 		struct sg_io_hdr hdr;
+#endif
+#ifdef CONFIG_GUASI
+		guasi_req_t greq;
 #endif
 #ifdef CONFIG_SOLARISAIO
 		aio_result_t resultp;

@@ -438,6 +438,8 @@ struct thread_data {
 	 */
 	unsigned int total_err_count;
 	int first_error;
+	int fd;
+	int stream_id;
 
 	struct fio_flow *flow;
 	unsigned long long flow_counter;
@@ -453,6 +455,10 @@ struct thread_data {
 	struct steadystate_data ss;
 
 	char verror[FIO_VERROR_SIZE];
+
+	uint32_t    zbd_ow_blk_count;	 	/* overwrites to be done in blocks per zone */
+	uint32_t    zbd_ow_blk_interval;	/* interval between overwrites */
+	uint64_t    zbd_finish_capacity;        /* capacity of zone when finish_zone_pct is specified */
 
 #ifdef CONFIG_CUDA
 	/*
